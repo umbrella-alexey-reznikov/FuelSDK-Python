@@ -33,6 +33,7 @@ class ET_Client(object):
     soap_client = None
     auth_url = None
     soap_endpoint = None
+    is_endpoints_tenant = False  # Auth and security flow differs
     soap_cache_file = "soap_cache_file.json"
 
     ## get_server_wsdl - if True and a newer WSDL is on the server than the local filesystem retrieve it
@@ -118,10 +119,13 @@ class ET_Client(object):
         else:
             wsdl_file_local_location = None
 
+        if params is not None and "is_endpoints_tenant" in params:
+            self.is_endpoints_tenant = params['is_endpoints_tenant']
+
         self.wsdl_file_url = self.load_wsdl(wsdl_server_url, wsdl_file_local_location, get_server_wsdl)
 
-        ## get the JWT from the params if passed in...or go to the server to get it             
-        if(params is not None and 'jwt' in params):
+        # get the JWT from the params if passed in...or go to the server to get it
+        if params is not None and 'jwt' in params:
             decodedJWT = jwt.decode(params['jwt'], self.appsignature)
             self.authToken = decodedJWT['request']['user']['oauthToken']
             self.authTokenExpiration = time.time() + decodedJWT['request']['user']['expiresIn']
@@ -176,15 +180,19 @@ class ET_Client(object):
         self.soap_client = suds.client.Client(self.wsdl_file_url, faults=False, cachingpolicy=1)
         self.soap_client.set_options(location=self.soap_endpoint)
         self.soap_client.set_options(headers={'user-agent' : 'FuelSDK-Python-v1.1.1'})
-
-        element_oAuth = Element('oAuth', ns=('etns', 'http://exacttarget.com'))
-        element_oAuthToken = Element('oAuthToken').setText(self.internalAuthToken)
-        element_oAuth.append(element_oAuthToken)
-        self.soap_client.set_options(soapheaders=(element_oAuth))
-
         security = suds.wsse.Security()
-        token = suds.wsse.UsernameToken('*', '*')
-        security.tokens.append(token)
+
+        if self.is_endpoints_tenant:
+            element_oAuthToken = Element('fueloauth', ns=('etns', 'http://exacttarget.com')).setText(self.internalAuthToken)
+            self.soap_client.set_options(soapheaders=element_oAuthToken)
+        else :
+            element_oAuth = Element('oAuth', ns=('etns', 'http://exacttarget.com'))
+            element_oAuthToken = Element('oAuthToken').setText(self.internalAuthToken)
+            element_oAuth.append(element_oAuthToken)
+            self.soap_client.set_options(soapheaders=element_oAuth)
+            token = suds.wsse.UsernameToken('*', '*')
+            security.tokens.append(token)
+
         self.soap_client.set_options(wsse=security)
         
 
@@ -194,30 +202,49 @@ class ET_Client(object):
         """
         #If we don't already have a token or the token expires within 5 min(300 seconds), get one
         if (force_refresh or self.authToken is None or (self.authTokenExpiration is not None and time.time() + 300 > self.authTokenExpiration)):
-            headers = {'content-type' : 'application/json', 'user-agent' : 'FuelSDK-Python-v1.1.1'}
-            if (self.authToken is None):
-                payload = {'clientId' : self.client_id, 'clientSecret' : self.client_secret, 'accessType': 'offline'}
-            else:
-                payload = {'clientId' : self.client_id, 'clientSecret' : self.client_secret, 'refreshToken' : self.refreshKey, 'accessType': 'offline'}
-            if self.refreshKey:
-                payload['refreshToken'] = self.refreshKey
+            headers = {'content-type': 'application/json', 'user-agent': 'FuelSDK-Python-v1.1.1'}
+            if self.is_endpoints_tenant:
+                if self.authToken is None:
+                    payload = {'client_id' : self.client_id, 'client_secret' : self.client_secret, 'grant_type': 'client_credentials'}
+                else:
+                    payload = {'client_id' : self.client_id, 'client_secret' : self.client_secret, 'refresh_token' : self.refreshKey, 'grant_type': 'client_credentials'}
+                if self.refreshKey:
+                    payload['refreshToken'] = self.refreshKey
 
-            legacyString = "?legacy=1"
-            if legacyString not in self.auth_url:
-                self.auth_url = self.auth_url.strip()
-                self.auth_url = self.auth_url + legacyString
+                r = requests.post(self.auth_url, data=json.dumps(payload), headers=headers)
+                token_response = r.json()
 
-            r = requests.post(self.auth_url, data=json.dumps(payload), headers=headers)
-            tokenResponse = r.json()
-            
-            if 'accessToken' not in tokenResponse:
-                raise Exception('Unable to validate App Keys(ClientID/ClientSecret) provided: ' + repr(r.json()))
-            
-            self.authToken = tokenResponse['accessToken']
-            self.authTokenExpiration = time.time() + tokenResponse['expiresIn']
-            self.internalAuthToken = tokenResponse['legacyToken']
-            if 'refreshToken' in tokenResponse:
-                self.refreshKey = tokenResponse['refreshToken']
+                if 'access_token' not in token_response:
+                    raise Exception('Unable to validate App Keys(ClientID/ClientSecret) provided: ' + repr(r.json()))
+
+                self.authToken = token_response['access_token']
+                self.authTokenExpiration = time.time() + token_response['expires_in']
+                self.internalAuthToken = token_response['access_token']
+            else :
+                if self.authToken is None:
+                    payload = {'clientId': self.client_id, 'clientSecret': self.client_secret, 'accessType': 'offline'}
+                else:
+                    payload = {'clientId': self.client_id, 'clientSecret': self.client_secret,
+                               'refreshToken': self.refreshKey, 'accessType': 'offline'}
+                if self.refreshKey:
+                    payload['refreshToken'] = self.refreshKey
+
+                legacyString = "?legacy=1"
+                if legacyString not in self.auth_url:
+                    self.auth_url = self.auth_url.strip()
+                    self.auth_url = self.auth_url + legacyString
+
+                r = requests.post(self.auth_url, data=json.dumps(payload), headers=headers)
+                token_response = r.json()
+
+                if 'accessToken' not in token_response:
+                    raise Exception('Unable to validate App Keys(ClientID/ClientSecret) provided: ' + repr(r.json()))
+
+                self.authToken = token_response['accessToken']
+                self.authTokenExpiration = time.time() + token_response['expiresIn']
+                self.internalAuthToken = token_response['legacyToken']
+            if 'refresh_token' in token_response:
+                self.refreshKey = token_response['refresh_token']
         
             self.build_soap_client()
 
